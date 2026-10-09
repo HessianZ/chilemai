@@ -20,3 +20,6 @@ menu.json
 .idea/
 .vscode/
 *.swp
+
+# 本地工作区数据（记忆、临时状态），不入公开仓库
+.workbuddy/
