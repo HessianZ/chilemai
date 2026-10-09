@@ -70,11 +70,14 @@
 
 ### 3. 安装本 Skill
 
-把本仓库放到 WorkBuddy 的技能目录即可（仓库根目录就是 Skill 根目录）：
+本仓库是公开仓库，直接 clone 即可（仓库根目录就是 Skill 根目录）：
 
 ```bash
-git clone git@github.com:HessianZ/chilemai.git ~/.workbuddy/skills/chilemai
+git clone https://github.com/HessianZ/chilemai.git ~/.workbuddy/skills/chilemai
 ```
+
+也可以直接用浏览器打开 <https://github.com/HessianZ/chilemai>，点右上角 `Code` → `Download ZIP`，
+解压后把目录重命名为 `chilemai` 放进 `~/.workbuddy/skills/`。
 
 ## 使用示例
 
