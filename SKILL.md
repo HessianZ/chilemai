@@ -12,7 +12,7 @@ agent_created: true
 
 > **用户**：中午想吃麦当劳，最近在减脂，预算 40。
 >
-> **吃了麦**：配好了 —— 板烧鸡腿堡 + 小杯玉米杯 + 无糖可乐，合计约 500 大卡、37 元。
+> **吃了麦**：配好了 —— 板烧鸡腿堡 + 无糖可乐，合计约 391 大卡、38 元。
 > 门店选杭州西湖区岳庙码头餐厅（3.6 km，营业到 22:00），领券后 33 元。要下单吗？
 >
 > **用户**：下。
@@ -42,7 +42,7 @@ agent_created: true
 Phase 1 解析意图  →  goal / 约束 / 场景 beType / 位置
 Phase 2 锁定门店  →  storeCode (+beCode)     ← 没有门店就拿不到菜单和价格
 Phase 3 拉全数据  →  query-meals + list-nutrition-foods
-Phase 4 组方案    →  交叉筛选 → 领券/用券 → calculate-price
+Phase 4 组方案    →  可信单品组合 → 整餐校验 → 比较优惠 → calculate-price
 Phase 5 下单      →  用户确认 → create-order → 支付 → query-order
 ```
 
@@ -61,16 +61,19 @@ Phase 5 下单      →  用户确认 → create-order → 支付 → query-orde
 | 位置 | 城市 + 位置关键词 | 到店场景**必须问**；外送读地址簿 |
 
 用户没提取餐方式时，用一句"到店自取还是送到家？"确认，**不要默认**。
+用户只说“控糖”时，先区分少喝含糖饮料还是限制总碳水；现有营养表没有糖含量，
+不能把低碳水当成低糖或血糖效果承诺。
 
 ### Phase 2 · 锁定门店
 
 - **到店自取 / 得来速** → `query-nearby-stores`
-  - 先试 `searchType=1` 查收藏门店；没有收藏再 `searchType=2` 带 `city` + `keyword`
+  - 用户指定收藏店时用 `searchType=1`；按当前位置找最近店时用 `searchType=2` 带 `city` + `keyword`
   - `beType=1` 自取（不传 beCode）；`beType=5` 得来速（**记下 beCode**）
 - **麦乐送 / 团餐** → `delivery-query-addresses` 取地址 → `delivery-query-stores` 取门店与 beCode
 
 默认挑**距离最近且在营业**的门店（用 `businessStatus` 与营业时间过滤）。展示时至少给：
 门店名、距离、营业时间。
+有收藏不代表离当前地点最近。距离最近也不等于最快取到餐；只有实际返回时间依据时才能比较速度。
 
 ### Phase 3 · 拉全数据
 
@@ -85,45 +88,64 @@ Phase 5 下单      →  用户确认 → create-order → 支付 → query-orde
 python3 scripts/chilemai.py match --menu menu.json --nutrition nutrition.txt
 ```
 
-脚本把结果分成三类，**第三类之外的数值要看清口径**：
+脚本把结果分成三类；`alias` 只给候选名称，**不再输出可直接合计的营养数值**：
 
 | 分类 | 含义 | 能不能当总热量用 |
 | --- | --- | --- |
-| 精确对齐 | 归一化后名称完全一致 | ✅ 可以 |
-| 仅单品口径 | 靠前缀/包含命中；标了 ⚠️ 的是套餐 | ❌ 套餐要再叠加配餐 + 饮品 |
-| 未对齐 | 营养库暂无该项 | ⚠️ 按菜单标签自行判断 |
+| 精确对齐 | 归一化后唯一匹配 | 单品可用；缺失数值不算零，套餐仍需确认组成 |
+| 待确认 | 前缀命中、杯型/规格不明或同名营养行冲突 | 不可；先核实规格与数据来源 |
+| 未对齐 | 营养库暂无该项 | 不可；严格营养目标不采用该项 |
+
+套餐需用 `query-meal-detail` 查清实际选择的主食、配餐、饮品与份数，再逐项核实营养。
+组成、规格或任一必要营养值不明时，明确“无法核算总营养”，不要估成确定值。
 
 > 这条不是洁癖：把「巨无霸三件套」按单品的 513 kcal 报给正在控热量的人，是**自信地答错**。
 
 ### Phase 4 · 组方案
 
-用脚本拿候选池，再**组一套**（主食 + 配餐 + 饮品/汤）而不是甩一个单品：
+用 `plan` 从在售且营养精确匹配的单品中组合一餐。先确认菜单价格原值的单位，
+再明确传 `--price-unit yuan`（元）或 `fen`（分），不能根据数值大小猜单位：
 
 ```bash
-python3 scripts/chilemai.py filter --goal light --limit 8 -f nutrition.txt
+python3 scripts/chilemai.py plan --menu menu.json --nutrition nutrition.txt \
+  --price-unit yuan --goal light --max-kcal 500 --limit 3
 ```
 
-核心口径（详见 `references/goals.md`）：
+`plan` 输出 JSON：`items` 可交给算价，`nutrition` 是整餐合计，`menu_subtotal_cents`
+是**菜单估价（分）**，`coverage` 说明数据覆盖。默认组合 1–3 份单品、至少一份主食，
+允许同品多份，配餐和饮品可选；套餐与待确认项不会自动纳入。
+无候选时说明覆盖限制或约束冲突，询问用户愿意调整什么，不擅自放宽。
 
-- **低卡类目标默认排除饮品与甜品**，否则会推荐"无糖可乐"当正餐
+核心口径与优惠比较详见 `references/goals.md`：
+
+- 单品低卡筛选默认排除饮品与甜品；整餐至少含一份主食，饮品只作可选搭配
 - 营养目标对**整单合计**成立，不是对单品成立
+- `filter` 仅用于查看单品，不能先用单品蛋白下限裁掉整餐组合的原料
+- 默认给一个推荐，确有取舍再补一个备选；不要为了凑配餐和饮品而增加花费
 - 价格一律走 `calculate-price`（返回值单位是**分**，展示要 ÷100）
 - 省钱诉求：先 `auto-bind-coupons` 一键领券，再 `query-store-coupons` 看本店可用券，
   把 `couponId` / `couponCode` 带进 `calculate-price`，对比用券前后的差价
+- 比较少量营养达标方案的单点、套餐与可用券；套餐也必须完成组成与营养核算
+- `--budget` 只限制菜单估价，不含优惠、配送费和打包费；找券后方案时可不设此参数。
+  最终以官方算价的实付总额校验用户预算，不能凭菜单估价承诺达标或断言无解
 
 ### Phase 5 · 下单
 
-1. **先展示方案让用户确认** —— 要花钱，不能自作主张
+1. **先展示方案让用户确认** —— 确认绑定门店、场景、地址/时间、餐品规格与份数、优惠和官方实付总额
 2. `create-order`；`orderType=1` 必须带 `takeWayCode`（取自 `calculate-price` 的 `takeWayList`）
 3. 把返回的支付链接交给用户
 4. 用户回复"支付完成 / 失败"后，用 `query-order` 核对最新状态
+
+换店、换餐、换规格、优惠失效或官方实付金额变化后重新算价，展示变化并重新确认。
+`create-order` 超时或结果不明时，不直接重试；按 `references/order-flow.md` 核查已有订单，
+无法确认是否创建成功时停在待核查状态，不新建第二单。
 
 ## 硬约束（传错就直接报错）
 
 - `beCode`：**到店自取绝不能传**；得来速 / 外送 / 团餐必传
 - `orderType`：到店自取与得来速为 `1`，麦乐送与团餐为 `2`
 - `takeWayCode`：仅 `orderType=1` 需要
-- 价格字段单位是**分**
+- `calculate-price` / `create-order` 的价格字段单位是**分**；菜单原值单位另行核实
 - 下单前必须有用户明确确认
 
 ## 输出风格

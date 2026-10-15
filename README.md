@@ -82,6 +82,7 @@ git clone https://github.com/HessianZ/chilemai.git ~/.workbuddy/skills/chilemai
 ## 使用示例
 
 直接说人话就行，不需要记任何指令。
+以下展示交互方式，餐品、价格、优惠和时间以当次工具结果为准。
 
 ### 例 1 · 减脂
 
@@ -89,10 +90,9 @@ git clone https://github.com/HessianZ/chilemai.git ~/.workbuddy/skills/chilemai
 >
 > **吃了麦**：配好了 ——
 > - 板烧鸡腿堡 ￥27 · 391 kcal · 23 g 蛋白
-> - 小杯玉米杯 ￥14.5 · 53 kcal
 > - 无糖可口可乐（中杯）￥11 · 0 kcal
 >
-> 合计约 **444 kcal / 37.5 元**。门店选「杭州西湖区岳庙码头餐厅」（3.6 km，营业至 22:00），
+> 合计约 **391 kcal / 38 元**，配餐不强行凑。门店选「杭州西湖区岳庙码头餐厅」（3.6 km，营业至 22:00），
 > 领券后 33 元。要下单吗？
 
 ### 例 2 · 增肌
@@ -107,7 +107,7 @@ git clone https://github.com/HessianZ/chilemai.git ~/.workbuddy/skills/chilemai
 > **你**：随便来点，别超过 25
 >
 > **吃了麦**：吉士汉堡包 ￥15.5（294 kcal）+ 小杯玉米杯 ￥14.5 超预算了，
-> 换成锡兰红茶 ￥9 的话合计 ￥24.5，349 kcal，刚好吃饱又不超。要用券吗？
+> 换成锡兰红茶 ￥9 的话合计 ￥24.5，296 kcal，不超预算。要用券吗？
 > 我看了下本店有一张满 20 减 5 的券，用完 ￥19.5。
 
 ### 例 4 · 送到家
@@ -127,7 +127,8 @@ chilemai/
 │   ├── mcp-tools.md          # MCP 工具速查 + beType/orderType/beCode 矩阵
 │   └── order-flow.md         # 四种场景的完整调用序
 ├── scripts/
-│   └── chilemai.py           # 营养解析 / 筛选 / 菜单对齐（仅标准库）
+│   └── chilemai.py           # 营养解析 / 可信匹配 / 整餐组合（仅标准库）
+├── tests/                    # 离线回归用例与合成菜单/营养样本
 ├── mcp-config.example.json   # 脱敏后的 MCP 配置示例
 ├── MCP_INTEGRATION.md        # 实际使用的 MCP Server / Tool / 调用流程 / 业务价值
 ├── CONTEST_DECLARATION.md    # 参赛声明（原文，未改动）
@@ -136,8 +137,8 @@ chilemai/
 
 ## 脚本用法
 
-`scripts/chilemai.py` 只依赖 Python 标准库，负责抹平两处数据脏点：
-营养表是**自定义文本格式**（不是 JSON），以及菜单与营养库的**名称不一致**。
+`scripts/chilemai.py` 只依赖 Python 标准库，解析**自定义文本营养表**（不是 JSON），
+核实菜单与营养库的名称匹配，并在整餐合计上检查营养条件。
 
 ```bash
 # 按目标筛选候选（低卡默认排除饮品与甜品）
@@ -145,10 +146,27 @@ python3 scripts/chilemai.py filter --goal light --limit 8 -f nutrition.txt
 
 # 在售菜单 × 营养库 名称对齐
 python3 scripts/chilemai.py match --menu menu.json --nutrition nutrition.txt
+
+# 组合一餐：先核实菜单价格原值单位，元用 yuan，分用 fen
+python3 scripts/chilemai.py plan --menu menu.json --nutrition nutrition.txt \
+  --price-unit yuan --goal light --max-kcal 500 --limit 3
+
+# 离线回归测试（合成数据，不接入真实账号、不创建订单）
+python3 -m unittest discover -s tests -v
 ```
 
-`match` 会把结果分成三类，**其中"仅单品口径"里标了 ⚠️ 的套餐不能把单品数值当总热量**——
-「巨无霸三件套」含薯条与饮料，真实热量远高于单品「巨无霸」的 513 kcal。
+`match` 输出“精确对齐 / 待确认 / 未对齐”。前缀命中、杯型不明或营养冲突的项目只返回候选名称，
+不再返回可用于合计的营养值；JSON 保留 `alias` 键，其项改为 `candidates` / `reason`。
+套餐即使精确同名，也需查询实际组成，不能把「巨无霸三件套」当单品的 513 kcal。
+
+`plan` 默认枚举 **1–3 份单品、至少一份主食**，同品可多份，配餐和饮品可选。
+只纳入精确匹配且热量、蛋白和价格已知的主食/配餐/饮品，套餐不自动参与。
+JSON 中 `items` 可供官方算价，`nutrition` 是按份数汇总的营养，缺失值保留 `null`；
+`coverage` 展示匹配与可用候选数。没有方案时退出码为 `1`，参数或数据格式错误为 `2`。
+
+`menu_subtotal_cents` 是**菜单估价（分）**，`--budget 40` 可选地将估价限制在 40 元内。
+估价不含优惠、配送或打包费；寻找券后方案时可不设 `--budget`，最后用 `calculate-price`
+核对实际总额与预算。脚本没有结果不代表全菜单或优惠后无解，也不会自动放宽约束。
 
 内置目标：`high-protein`、`low-cal`、`light`、`low-fat`、`low-sodium`、`low-carb`、`any`。
 

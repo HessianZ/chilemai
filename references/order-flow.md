@@ -21,7 +21,7 @@
 
 3. list-nutrition-foods
    { }
-   → 存 nutrition.txt，跑 scripts/chilemai.py match / filter 交叉筛选
+   → 存 nutrition.txt，跑 scripts/chilemai.py match / plan 核实匹配与整餐营养
 
 4. query-store-coupons
    { "storeCode": "3330257", "orderType": 1, "beType": 1 }
@@ -32,7 +32,7 @@
                 { "productCode": "4437", "quantity": 1 } ] }
    → 价格单位是分；记下 data.takeWayList[].code
 
-6. 【给用户看方案，等确认】
+6. 【给用户看门店、餐品规格与份数、整餐营养、优惠及官方实付，等确认】
 
 7. create-order
    { "storeCode": "3330257", "orderType": 1, "beType": 1,
@@ -85,7 +85,7 @@
 4. list-nutrition-foods { } → 脚本筛选（外送餐品与到店可能有差异）
 
 5. calculate-price { "storeCode": "...", "orderType": 2, "beType": 2, "beCode": "...", "items": [...] }
-   → 注意含配送费；orderType=2 **不需要** takeWayCode
+   → 按官方实付总额核对预算，包含适用的配送/打包等费用；orderType=2 **不需要** takeWayCode
 
 6. 【确认】
 
@@ -154,3 +154,14 @@
 - 用户回"支付完成 / 支付失败" → `query-order` 核对最新状态，**不要凭猜测说已支付**
 - 用户要取消 → `cancel-order`，问清原因码
 - 用户问配送进度 → `query-order`
+
+## 确认后的变更与创建失败
+
+- 用户确认针对具体的门店、场景、地址/时间、餐品规格与数量、优惠和官方实付总额。
+  换店、换餐、换规格、优惠失效或金额变化后重新算价，展示变化并重新确认，再创建订单。
+- `create-order` 返回明确的失败信息时，按错误修正；涉及上述内容变化仍需重新确认。
+- 超时、断连或返回结果无法判断是否成功时，**不直接重试创建**。
+  已有 `orderId` 用 `query-order` 核查；没有则用 `order-list` 检查本次时间段、门店、金额与餐品对应的订单。
+  有候选时再查详情确认，不凭“最新一单”认领。确认已创建则返回已有支付入口。
+- 暂未查到订单不等于确定未创建。无法确认时告诉用户“创建结果待核查”，
+  请用户在官方订单页核实；状态未澄清前不新建第二单。后续重建也需用户明确确认。

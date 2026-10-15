@@ -8,6 +8,7 @@
 子命令
     filter   按营养目标筛选 + 排序
     match    把在售菜单与营养库做名称对齐
+    plan     从可信单品组合一餐，校验整餐营养与菜单估价
 
 用法
     cat nutrition.txt | python3 chilemai.py filter --goal low-cal --limit 8
@@ -19,7 +20,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from decimal import Decimal, InvalidOperation
+import heapq
+from itertools import combinations_with_replacement
 import json
+import math
 import re
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -75,8 +81,8 @@ GOALS: Dict[str, Dict[str, Any]] = {
         "sort": ("protein_per_100kcal", "desc"),
         "kinds": ["main"],
     },
-    # 想吃点什么但不设约束时，只在主食里按招牌/人气挑
-    "any": {"sort": ("protein_per_100kcal", "desc"), "kinds": ["main"]},
+    # 未指定营养目标时保留数据源顺序，不擅自当成健身餐排序
+    "any": {"kinds": ["main"]},
 }
 
 # 餐品类型关键词表。匹配顺序：甜品 -> 饮品 -> 主食 -> 配餐 -> 兜底主食。
@@ -133,7 +139,8 @@ def _to_number(raw: str) -> Optional[float]:
     if not raw or raw.lower() in {"null", "none", "-", ""}:
         return None
     try:
-        return float(raw)
+        value = float(raw)
+        return value if math.isfinite(value) and value >= 0 else None
     except ValueError:
         return None
 
@@ -149,15 +156,20 @@ def parse_nutrition(text: str) -> List[Dict[str, Any]]:
     if not lines:
         return []
 
-    header_idx = 0
+    header_idx = None
     for i, ln in enumerate(lines):
         if re.match(r"^\[\d+\]\{", ln.strip()):
             header_idx = i
             break
 
+    if header_idx is None:
+        raise ValueError("营养表缺少 [数量]{字段,...}: 格式的表头")
+
     header = lines[header_idx].strip()
     inner = header[header.find("{") + 1 : header.rfind("}")]
     columns = [c.strip() for c in inner.split(",")] or COLUMNS
+    if not {"productName", "energyKcal", "protein"}.issubset(columns):
+        raise ValueError("营养表缺少 productName / energyKcal / protein 必要字段")
 
     rows: List[Dict[str, Any]] = []
     seen: set = set()
@@ -174,10 +186,11 @@ def parse_nutrition(text: str) -> List[Dict[str, Any]]:
             row[col] = _to_number(val) if col in NUMERIC else val
         if not row.get("productName"):
             continue
-        # 官方营养表存在同名重复行，去重避免推荐列表出现重复项
-        if row["productName"] in seen:
+        # 只合并内容相同的行；同名但数值冲突的行留给 match 标为待确认
+        signature = tuple(row.get(col) for col in columns)
+        if signature in seen:
             continue
-        seen.add(row["productName"])
+        seen.add(signature)
         kcal = row.get("energyKcal") or 0.0
         protein = row.get("protein") or 0.0
         row["protein_per_100kcal"] = round(protein / kcal * 100, 1) if kcal > 0 else 0.0
@@ -220,8 +233,9 @@ def apply_goal(
             continue
         kept.append(row)
 
-    sort_field, direction = spec.get("sort", ("energyKcal", "asc"))
-    kept.sort(key=lambda r: r.get(sort_field) or 0.0, reverse=(direction == "desc"))
+    if "sort" in spec:
+        sort_field, direction = spec["sort"]
+        kept.sort(key=lambda r: r.get(sort_field) or 0.0, reverse=(direction == "desc"))
     return kept
 
 
@@ -277,44 +291,126 @@ def match_menu(
     """在售菜单 x 营养库 名称对齐。
 
     返回 (exact, alias, unmatched)：
-      exact  —— 名称归一化后完全一致，营养数值可直接使用
-      alias  —— 仅靠前缀/包含命中。营养库只有单品口径；若菜单项是套餐，
-                真实热量还要叠加配餐与饮品，绝不能当成总数展示
-      unmatched —— 营养库没有对应项，只能依据菜单标签判断
+      exact  —— 名称归一化后唯一匹配；套餐仍需确认组成
+      alias  —— 名称/规格未确认或营养行冲突，仅返回候选名称，不返回营养数值
+      unmatched —— 营养库没有对应项，不参与严格营养目标计算
     """
-    index: Dict[str, Dict[str, Any]] = {}
+    index: Dict[str, List[Dict[str, Any]]] = {}
     for row in nutrition:
-        index.setdefault(normalize(row["productName"]), row)
+        index.setdefault(normalize(row["productName"]), []).append(row)
 
     exact: List[Dict[str, Any]] = []
     alias: List[Dict[str, Any]] = []
     unmatched: List[Dict[str, Any]] = []
     for item in menu:
         key = normalize(item["name"])
-        row = index.get(key)
-        if row is not None:
-            exact.append({**item, "nutrition": row, "combo": False})
+        combo = any(hint in item["name"] for hint in COMBO_HINTS)
+        matches = index.get(key, [])
+        if len(matches) == 1:
+            exact.append({**item, "nutrition": matches[0], "combo": combo})
             continue
-        # 退一步：菜单名与营养名互为前缀（"雪碧" <-> "雪碧中杯"）
-        fuzzy = next(
-            (
-                nrow
-                for nkey, nrow in index.items()
-                if nkey.startswith(key) or key.startswith(nkey)
-            ),
-            None,
-        )
-        if fuzzy is not None:
+        # 前缀只能产生待核实候选，不能用第一条记录决定杯型、份量或套餐热量
+        candidates = matches or [
+            nrow for nkey, nrows in index.items()
+            if key and (nkey.startswith(key) or key.startswith(nkey))
+            for nrow in nrows
+        ]
+        if candidates:
             alias.append(
                 {
                     **item,
-                    "nutrition": fuzzy,
-                    "combo": any(hint in item["name"] for hint in COMBO_HINTS),
+                    "candidates": sorted({row["productName"] for row in candidates}),
+                    "combo": combo,
+                    "reason": "同名营养数据冲突" if matches else "名称或规格未确认",
                 }
             )
         else:
             unmatched.append(item)
     return exact, alias, unmatched
+
+
+def _price_cents(value: Any, unit: str) -> Optional[int]:
+    """按显式单位转成整数分；未知或不足一分的价格不能用于预算估算。"""
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    cents = amount * (100 if unit == "yuan" else 1)
+    return int(cents) if cents == cents.to_integral_value() else None
+
+
+def plan_meals(
+    menu: List[Dict[str, Any]], nutrition: List[Dict[str, Any]],
+    goal: str, overrides: Dict[str, float], price_unit: str,
+    budget_cents: Optional[int] = None, limit: int = 3,
+) -> Dict[str, Any]:
+    """枚举 1–3 份单品（可重复），在整餐合计上应用营养约束。
+
+    价格只用于菜单估算，不含券、配送费或打包费，不能替代 calculate-price。
+    未确认匹配、套餐、未知价格和热量/蛋白缺失的餐品不参与组合。
+    """
+    exact, uncertain, unmatched = match_menu(menu, nutrition)
+    candidates = []
+    for item in exact:
+        row = item["nutrition"]
+        cents = _price_cents(item.get("price"), price_unit)
+        if (item["combo"] or not item.get("code") or cents is None
+                or row.get("energyKcal") is None or row.get("protein") is None
+                or row.get("kind") not in {"main", "side", "drink"}):
+            continue
+        candidates.append({**item, "cents": cents})
+
+    def meals():
+        for count in range(1, 4):
+            for indices in combinations_with_replacement(range(len(candidates)), count):
+                selected = [candidates[i] for i in indices]
+                if not any(item["nutrition"]["kind"] == "main" for item in selected):
+                    continue
+                subtotal = sum(item["cents"] for item in selected)
+                if budget_cents is not None and subtotal > budget_cents:
+                    continue
+                totals = {}
+                for field in NUMERIC:
+                    values = [item["nutrition"].get(field) for item in selected]
+                    totals[field] = (
+                        round(sum(values), 4) if all(v is not None for v in values) else None
+                    )
+                kcal = totals["energyKcal"]
+                totals["protein_per_100kcal"] = (
+                    round(totals["protein"] / kcal * 100, 1) if kcal > 0 else 0.0
+                )
+                # 用整餐的虚拟行复用阈值校验；不先按单品门槛筛选
+                if not apply_goal([{**totals, "kind": "main"}], goal, overrides):
+                    continue
+                quantities = Counter(item["code"] for item in selected)
+                yield {
+                    "items": [{"productCode": code, "quantity": qty}
+                              for code, qty in quantities.items()],
+                    "names": list(dict.fromkeys(item["name"] for item in selected)),
+                    "nutrition": totals,
+                    "menu_subtotal_cents": subtotal,
+                }
+
+    def rank(meal):
+        field, direction = GOALS[goal].get("sort", ("energyKcal", "asc"))
+        score = meal["nutrition"].get(field) or 0.0
+        if direction == "desc":
+            score = -score
+        # 未指定营养目标时按估价排序，不默认追求高蛋白
+        return (score if goal != "any" else 0, meal["menu_subtotal_cents"],
+                sum(item["quantity"] for item in meal["items"]))
+
+    return {
+        "plans": heapq.nsmallest(limit, meals(), key=rank),
+        "pricing": "menu_estimate",
+        "budget_cents": budget_cents,
+        "max_items": 3,
+        "coverage": {"menu_items": len(menu), "exact": len(exact),
+                     "uncertain": len(uncertain), "unmatched": len(unmatched),
+                     "eligible": len(candidates)},
+    }
 
 
 def _read(path: Optional[str]) -> str:
@@ -374,11 +470,34 @@ def cmd_filter(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan(args: argparse.Namespace) -> int:
+    budget = _price_cents(args.budget, "yuan") if args.budget is not None else None
+    if args.budget is not None and budget is None:
+        raise ValueError("--budget 必须是非负金额，最多两位小数（元）")
+    if args.limit < 1:
+        raise ValueError("--limit 必须大于 0")
+    overrides = {"max_energyKcal": args.max_kcal, "max_fat": args.max_fat,
+                 "max_sodium": args.max_sodium, "max_carbohydrate": args.max_carb,
+                 "min_protein": args.min_protein}
+    if any(v is not None and (not math.isfinite(v) or v < 0) for v in overrides.values()):
+        raise ValueError("营养阈值必须是非负有限数值")
+    with open(args.menu, encoding="utf-8") as fh:
+        menu = extract_menu_items(json.load(fh))
+    result = plan_meals(menu, parse_nutrition(_read(args.nutrition)), args.goal,
+                        overrides, args.price_unit, budget, args.limit)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result["plans"]:
+        print("可信单品的 1–3 份组合无匹配方案；请检查数据覆盖与约束。"
+              "菜单估价不含优惠及配送费，不能据此断言实际预算无解。", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _row(item: Dict[str, Any], n: Dict[str, Any], note: str) -> str:
     return "| {code} | {name} | {price} | {nname} | {kcal} | {protein} | {fat} | {sodium} | {note} |".format(
         code=item["code"],
         name=item["name"],
-        price=item.get("price") or "-",
+        price=item["price"] if item.get("price") is not None else "-",
         nname=n["productName"],
         kcal=_fmt(n.get("energyKcal")),
         protein=_fmt(n.get("protein")),
@@ -389,7 +508,7 @@ def _row(item: Dict[str, Any], n: Dict[str, Any], note: str) -> str:
 
 
 _HEADER = (
-    "| 编码 | 在售名称 | 价格(元) | 营养库名称 | 热量(kcal) | 蛋白(g) | 脂肪(g) | 钠(mg) | 说明 |",
+    "| 编码 | 在售名称 | 价格(菜单原值) | 营养库名称 | 热量(kcal) | 蛋白(g) | 脂肪(g) | 钠(mg) | 说明 |",
     "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |",
 )
 
@@ -411,28 +530,28 @@ def cmd_match(args: argparse.Namespace) -> int:
         return 0
 
     print(
-        f"# 在售 {len(menu)} 项：精确对齐 {len(exact)}，仅单品口径 {len(alias)}，"
+        f"# 在售 {len(menu)} 项：精确对齐 {len(exact)}，待确认 {len(alias)}，"
         f"未对齐 {len(unmatched)}"
     )
     print()
-    print("## 精确对齐（营养数值可直接使用）")
+    print("## 精确对齐（套餐仍需核实组成，缺失数值不代表零）")
     print()
     print(*_HEADER, sep="\n")
     for item in exact:
-        print(_row(item, item["nutrition"], "-"))
+        print(_row(item, item["nutrition"], "套餐：需核实组成" if item["combo"] else "-"))
 
     if alias:
         print()
-        print("## 仅单品口径（⚠️ 带组合含义的，热量需再叠加配餐与饮品）")
+        print("## 待确认（不提供可用于合计的营养数值）")
         print()
-        print(*_HEADER, sep="\n")
         for item in alias:
-            note = "⚠️ 套餐：需叠加配餐+饮品" if item["combo"] else "单品口径"
-            print(_row(item, item["nutrition"], note))
+            note = "；套餐需核实组成" if item["combo"] else ""
+            print(f"- {item['code']} {item['name']} → {' / '.join(item['candidates'])}"
+                  f"（{item['reason']}{note}）")
 
     if unmatched:
         print()
-        print("## 未对齐（营养库暂无，按菜单标签自行判断）")
+        print("## 未对齐（营养未知，不参与严格营养目标计算）")
         for item in unmatched:
             print(f"- {item['code']} {item['name']}")
     return 0
@@ -444,7 +563,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 兼容 `--goal low-cal` 与位置式 `low-cal` 两种写法
     shared = argparse.ArgumentParser(add_help=False)
-    shared.add_argument("goal_pos", nargs="?", default=None, help=argparse.SUPPRESS)
+    shared.add_argument("goal_pos", nargs="?", choices=sorted(GOALS), default=None,
+                        help=argparse.SUPPRESS)
 
     f = sub.add_parser("filter", parents=[shared], help="按营养目标筛选")
     f.add_argument("--goal", choices=sorted(GOALS), default=None)
@@ -468,14 +588,33 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--nutrition", default=None, help="营养原始文本，默认 stdin")
     m.add_argument("--json", action="store_true")
     m.set_defaults(func=cmd_match)
+
+    p = sub.add_parser("plan", help="按整餐营养组合 1–3 份可信单品，输出 JSON")
+    p.add_argument("--menu", required=True, help="query-meals 返回的 JSON 文件")
+    p.add_argument("--nutrition", default=None, help="营养原始文本，默认 stdin")
+    p.add_argument("--price-unit", required=True, choices=["yuan", "fen"],
+                   help="菜单价格原值单位，必须先核实；不代表官方实付金额")
+    p.add_argument("--goal", choices=sorted(GOALS), default="any")
+    p.add_argument("--budget", default=None, help="可选的菜单估价上限（元），不含优惠及配送费")
+    p.add_argument("--max-kcal", type=float, default=None)
+    p.add_argument("--max-fat", type=float, default=None)
+    p.add_argument("--max-sodium", type=float, default=None)
+    p.add_argument("--max-carb", type=float, default=None)
+    p.add_argument("--min-protein", type=float, default=None)
+    p.add_argument("--limit", type=int, default=3)
+    p.set_defaults(func=cmd_plan)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if getattr(args, "goal", None) is None and getattr(args, "goal_pos", None):
         args.goal = args.goal_pos
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

@@ -33,8 +33,9 @@
 | `delivery-create-address` | 新建配送地址 | `city`、`contactName`、`phone`、`address`、`addressDetail`、`gender` |
 | `delivery-query-stores` | 某地址可配送门店 | `addressId`、`beType`(2 或 6) |
 
-`searchType=2` 时 `city` 与 `keyword` **都必填**。先试 `searchType=1` 读收藏，
-没有收藏再退到按位置搜。
+`searchType=2` 时 `city` 与 `keyword` **都必填**。`searchType=1` 读收藏，
+用户指定收藏店时使用；用户要求离当前位置最近时，直接按已确认的 city + keyword 搜索，
+不要用收藏店代替最近门店。
 
 ### 2. 餐品与营养
 
